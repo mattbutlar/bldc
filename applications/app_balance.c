@@ -86,7 +86,7 @@ static float startup_step_size, tiltback_step_size, torquetilt_on_step_size, tor
 static float pitch_angle, last_pitch_angle, roll_angle, abs_roll_angle, abs_roll_angle_sin;
 static float gyro[3];
 static float duty_cycle, abs_duty_cycle;
-static float erpm, abs_erpm, avg_erpm;
+static float erpm, abs_erpm, avg_erpm, last_erpm;
 static float motor_current;
 static float motor_position;
 static float adc1, adc2;
@@ -95,8 +95,9 @@ static SwitchState switch_state;
 // Rumtime state values
 static BalanceState state;
 static float proportional, integral, derivative;
+static float inner_proportional, inner_integral, inner_derivative;
 static float last_proportional, abs_proportional;
-static float pid_value;
+static float pid_value, inner_pid_value;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
 static float constanttilt_target, constanttilt_interpolated;
 static float torquetilt_filtered_current, torquetilt_target, torquetilt_interpolated;
@@ -107,10 +108,11 @@ static float yaw_proportional, yaw_integral, yaw_derivative, yaw_last_proportion
 static systime_t current_time, last_time, diff_time, loop_overshoot;
 static float filtered_loop_overshoot, loop_overshoot_alpha, filtered_diff_time;
 static systime_t fault_angle_pitch_timer, fault_angle_roll_timer, fault_switch_timer, fault_switch_half_timer, fault_duty_timer;
-static float d_pt1_lowpass_state, d_pt1_lowpass_k, d_pt1_highpass_state, d_pt1_highpass_k;
+static float d_pt1_lowpass_state, d_pt1_lowpass_k, d_pt1_highpass_state, d_pt1_highpass_k, d2_pt1_lowpass_state, d2_pt1_highpass_state;
 static Biquad d_biquad_lowpass, d_biquad_highpass;
 static float motor_timeout;
 static systime_t brake_timeout;
+static float last_measured_acceleration;
 
 // Debug values
 static int debug_render_1, debug_render_2;
@@ -302,6 +304,7 @@ static void reset_vars(void){
 	last_time = 0;
 	diff_time = 0;
 	brake_timeout = 0;
+	last_measured_acceleration = 0;
 }
 
 static float get_setpoint_adjustment_step_size(void){
@@ -535,39 +538,50 @@ static void brake(void){
 	timeout_reset();
 	// Set current
 	mc_interface_set_brake_current(balance_conf.brake_current);
-	if(balance_conf.multi_esc){
-		for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
-			can_status_msg *msg = comm_can_get_status_msg_index(i);
-			if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
-				comm_can_set_current_brake(msg->id, balance_conf.brake_current);
-			}
-		}
-	}
+//	if(balance_conf.multi_esc){
+//		for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
+//			can_status_msg *msg = comm_can_get_status_msg_index(i);
+//			if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
+//				comm_can_set_current_brake(msg->id, balance_conf.brake_current);
+//			}
+//		}
+//	}
 }
 
 static void set_current(float current, float yaw_current){
 	// Reset the timeout
 	timeout_reset();
 	// Set current
-	if(balance_conf.multi_esc){
-		// Set the current delay
-		mc_interface_set_current_off_delay(motor_timeout);
-		// Set Current
-		mc_interface_set_current(current + yaw_current);
-		// Can bus
-		for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
-			can_status_msg *msg = comm_can_get_status_msg_index(i);
-
-			if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
-				comm_can_set_current_off_delay(msg->id, current - yaw_current, motor_timeout);// Assume 2 motors, i don't know how to steer 3 anyways
-			}
-		}
-	} else {
+//	if(balance_conf.multi_esc){
+//		// Set the current delay
+//		mc_interface_set_current_off_delay(motor_timeout);
+//		// Set Current
+//		mc_interface_set_current(current + yaw_current);
+//		// Can bus
+//		for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
+//			can_status_msg *msg = comm_can_get_status_msg_index(i);
+//
+//			if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
+//				comm_can_set_current_off_delay(msg->id, current - yaw_current, motor_timeout);// Assume 2 motors, i don't know how to steer 3 anyways
+//			}
+//		}
+//	} else {
 		// Set the current delay
 		mc_interface_set_current_off_delay(motor_timeout);
 		// Set Current
 		mc_interface_set_current(current);
-	}
+//	}
+}
+
+static float average_filter(float args[]) {
+    float sum = 0;
+    int count = (int)(sizeof(args) / sizeof(args[0]));
+
+    for (int i = 0; i < count; i++) {
+        sum += args[i];
+    }
+
+    return sum / count;
 }
 
 static THD_FUNCTION(balance_thread, arg) {
@@ -603,16 +617,16 @@ static THD_FUNCTION(balance_thread, arg) {
 		abs_duty_cycle = fabsf(duty_cycle);
 		erpm = mc_interface_get_rpm();
 		abs_erpm = fabsf(erpm);
-		if(balance_conf.multi_esc){
-			avg_erpm = erpm;
-			for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
-				can_status_msg *msg = comm_can_get_status_msg_index(i);
-				if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
-					avg_erpm += msg->rpm;
-				}
-			}
-			avg_erpm = avg_erpm/2;// Assume 2 motors, i don't know how to steer 3 anyways
-		}
+//		if(balance_conf.multi_esc){
+//			avg_erpm = erpm;
+//			for (int i = 0;i < CAN_STATUS_MSGS_TO_STORE;i++) {
+//				can_status_msg *msg = comm_can_get_status_msg_index(i);
+//				if (msg->id >= 0 && UTILS_AGE_S(msg->rx_time) < MAX_CAN_AGE) {
+//					avg_erpm += msg->rpm;
+//				}
+//			}
+//			avg_erpm = avg_erpm/2;// Assume 2 motors, i don't know how to steer 3 anyways
+//		}
 		adc1 = (((float)ADC_Value[ADC_IND_EXT])/4095) * V_REG;
 #ifdef ADC_IND_EXT2
 		adc2 = (((float)ADC_Value[ADC_IND_EXT2])/4095) * V_REG;
@@ -700,6 +714,48 @@ static THD_FUNCTION(balance_thread, arg) {
 
 				pid_value = (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative);
 
+                if(balance_conf.multi_esc){
+                    float accelerations[] = { last_measured_acceleration, (erpm - last_erpm) };
+                    float measured_acceleration = average_filter(accelerations);
+
+                    inner_proportional = pid_value - measured_acceleration;
+                    inner_integral += inner_proportional;
+                    inner_derivative = last_measured_acceleration - measured_acceleration;
+
+                    // Apply D term filters
+                    if(balance_conf.kd_pt1_lowpass_frequency > 0){
+                        d2_pt1_lowpass_state = d2_pt1_lowpass_state + d_pt1_lowpass_k * (inner_derivative - d2_pt1_lowpass_state);
+                        inner_derivative = d2_pt1_lowpass_state;
+                    }
+                    if(balance_conf.kd_pt1_highpass_frequency > 0){
+                        d2_pt1_highpass_state = d2_pt1_highpass_state + d_pt1_highpass_k * (inner_derivative - d2_pt1_highpass_state);
+                        inner_derivative = derivative - d2_pt1_highpass_state;
+                    }
+                    if(balance_conf.kd_biquad_lowpass > 0){
+                        inner_derivative = biquad_process(inner_derivative, &d_biquad_lowpass);
+                    }
+                    if(balance_conf.kd_biquad_highpass > 0){
+                        inner_derivative = biquad_process(inner_derivative, &d_biquad_highpass);
+                    }
+
+                    inner_pid_value =
+                            (balance_conf.kp * inner_proportional) +
+                            (balance_conf.ki * inner_integral) +
+                            (balance_conf.kd * inner_derivative);
+
+                    // limit output current
+                    float amplimit = 30.0;
+                    if (fabsf(inner_pid_value) > amplimit) {
+                        inner_pid_value = amplimit * SIGN(inner_pid_value);
+                    }
+
+                    float pids[] = { pid_value, inner_pid_value };
+                    pid_value = average_filter(pids);
+
+                    last_erpm = erpm;
+                    last_measured_acceleration = measured_acceleration;
+                }
+
 				last_proportional = proportional;
 
 				// Apply Booster
@@ -713,30 +769,30 @@ static THD_FUNCTION(balance_thread, arg) {
 				}
 
 
-				if(balance_conf.multi_esc){
-					// Calculate setpoint
-					if(abs_duty_cycle < .02){
-						yaw_setpoint = 0;
-					} else if(avg_erpm < 0){
-						yaw_setpoint = (-balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
-					} else{
-						yaw_setpoint = (balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
-					}
-					// Do PID maths
-					yaw_proportional = yaw_setpoint - gyro[2];
-					yaw_integral = yaw_integral + yaw_proportional;
-					yaw_derivative = yaw_proportional - yaw_last_proportional;
-
-					yaw_pid_value = (balance_conf.yaw_kp * yaw_proportional) + (balance_conf.yaw_ki * yaw_integral) + (balance_conf.yaw_kd * yaw_derivative);
-
-					if(yaw_pid_value > balance_conf.yaw_current_clamp){
-						yaw_pid_value = balance_conf.yaw_current_clamp;
-					}else if(yaw_pid_value < -balance_conf.yaw_current_clamp){
-						yaw_pid_value = -balance_conf.yaw_current_clamp;
-					}
-
-					yaw_last_proportional = yaw_proportional;
-				}
+//				if(balance_conf.multi_esc){
+//					// Calculate setpoint
+//					if(abs_duty_cycle < .02){
+//						yaw_setpoint = 0;
+//					} else if(avg_erpm < 0){
+//						yaw_setpoint = (-balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
+//					} else{
+//						yaw_setpoint = (balance_conf.roll_steer_kp * roll_angle) + (balance_conf.roll_steer_erpm_kp * roll_angle * avg_erpm);
+//					}
+//					// Do PID maths
+//					yaw_proportional = yaw_setpoint - gyro[2];
+//					yaw_integral = yaw_integral + yaw_proportional;
+//					yaw_derivative = yaw_proportional - yaw_last_proportional;
+//
+//					yaw_pid_value = (balance_conf.yaw_kp * yaw_proportional) + (balance_conf.yaw_ki * yaw_integral) + (balance_conf.yaw_kd * yaw_derivative);
+//
+//					if(yaw_pid_value > balance_conf.yaw_current_clamp){
+//						yaw_pid_value = balance_conf.yaw_current_clamp;
+//					}else if(yaw_pid_value < -balance_conf.yaw_current_clamp){
+//						yaw_pid_value = -balance_conf.yaw_current_clamp;
+//					}
+//
+//					yaw_last_proportional = yaw_proportional;
+//				}
 
 				// Output to motor
 				set_current(pid_value, yaw_pid_value);
