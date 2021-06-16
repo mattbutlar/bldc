@@ -39,6 +39,8 @@
 // Can
 #define MAX_CAN_AGE 0.1
 
+#define ARR_SIZEOF(x)  (sizeof(x) / sizeof((x)[0]))
+
 // Data type (Value 5 was removed, and can be reused at a later date, but i wanted to preserve the current value's numbers for UIs)
 typedef enum {
 	STARTUP = 0,
@@ -95,9 +97,9 @@ static SwitchState switch_state;
 // Rumtime state values
 static BalanceState state;
 static float proportional, integral, derivative;
-static float inner_proportional, inner_integral, inner_derivative;
+static float outer_proportional, outer_integral, outer_derivative;
 static float last_proportional, abs_proportional;
-static float pid_value, inner_pid_value;
+static float pid_value, outer_pid_value, inner_pid_value;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
 static float constanttilt_target, constanttilt_interpolated;
 static float torquetilt_filtered_current, torquetilt_target, torquetilt_interpolated;
@@ -113,6 +115,14 @@ static Biquad d_biquad_lowpass, d_biquad_highpass;
 static float motor_timeout;
 static systime_t brake_timeout;
 static float last_measured_acceleration;
+
+static int outer_loop_count;
+static int inner_loop_multiplier;
+static const volatile mc_configuration *mc_conf;
+
+#define RPM(x)  (x / (mc_conf->si_motor_poles / 2))
+#define RPS(x)  (RPM(x) / 60)
+#define RPL(x)  (RPS(x) / balance_conf.hertz)
 
 // Debug values
 static int debug_render_1, debug_render_2;
@@ -205,6 +215,7 @@ void app_balance_configure(balance_config *conf, imu_config *conf2) {
 }
 
 void app_balance_start(void) {
+    mc_conf = mc_interface_get_configuration();
 	// First start only, override state to startup
 	state = STARTUP;
 	// Register terminal commands
@@ -305,6 +316,8 @@ static void reset_vars(void){
 	diff_time = 0;
 	brake_timeout = 0;
 	last_measured_acceleration = 0;
+	outer_loop_count = 0;
+	inner_loop_multiplier = 5;
 }
 
 static float get_setpoint_adjustment_step_size(void){
@@ -573,9 +586,8 @@ static void set_current(float current, float yaw_current){
 //	}
 }
 
-static float average_filter(float args[]) {
+static float average_filter(float args[], int count) {
     float sum = 0;
-    int count = (int)(sizeof(args) / sizeof(args[0]));
 
     for (int i = 0; i < count; i++) {
         sum += args[i];
@@ -715,45 +727,48 @@ static THD_FUNCTION(balance_thread, arg) {
 				pid_value = (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative);
 
                 if(balance_conf.multi_esc){
-                    float accelerations[] = { last_measured_acceleration, (erpm - last_erpm) };
-                    float measured_acceleration = average_filter(accelerations);
+                    inner_pid_value = pid_value;
 
-                    inner_proportional = pid_value - measured_acceleration;
-                    inner_integral += inner_proportional;
-                    inner_derivative = last_measured_acceleration - measured_acceleration;
+                    if (outer_loop_count >= inner_loop_multiplier){
+                        float measured_acceleration = ((RPL(last_erpm) - RPL(erpm)) * (balance_conf.hertz / inner_loop_multiplier));
 
-                    // Apply D term filters
-                    if(balance_conf.kd_pt1_lowpass_frequency > 0){
-                        d2_pt1_lowpass_state = d2_pt1_lowpass_state + d_pt1_lowpass_k * (inner_derivative - d2_pt1_lowpass_state);
-                        inner_derivative = d2_pt1_lowpass_state;
+                        outer_proportional = measured_acceleration;
+                        outer_integral += outer_proportional;
+                        outer_derivative = last_measured_acceleration - measured_acceleration;
+
+                        // Apply D term filters
+                        if(balance_conf.kd_pt1_lowpass_frequency > 0){
+                            d2_pt1_lowpass_state = d2_pt1_lowpass_state + d_pt1_lowpass_k * (outer_derivative - d2_pt1_lowpass_state);
+                            outer_derivative = d2_pt1_lowpass_state;
+                        }
+                        if(balance_conf.kd_pt1_highpass_frequency > 0){
+                            d2_pt1_highpass_state = d2_pt1_highpass_state + d_pt1_highpass_k * (outer_derivative - d2_pt1_highpass_state);
+                            outer_derivative = outer_derivative - d2_pt1_highpass_state;
+                        }
+                        if(balance_conf.kd_biquad_lowpass > 0){
+                            outer_derivative = biquad_process(outer_derivative, &d_biquad_lowpass);
+                        }
+                        if(balance_conf.kd_biquad_highpass > 0){
+                            outer_derivative = biquad_process(outer_derivative, &d_biquad_highpass);
+                        }
+
+                        outer_pid_value =
+                                (balance_conf.yaw_kp * outer_proportional) +
+                                (balance_conf.yaw_ki * outer_integral) +
+                                (balance_conf.yaw_kd * outer_derivative);
+
+                        last_erpm = erpm;
+                        last_measured_acceleration = measured_acceleration;
+                        outer_loop_count = 0;
+                    } else {
+                        outer_loop_count++;
                     }
-                    if(balance_conf.kd_pt1_highpass_frequency > 0){
-                        d2_pt1_highpass_state = d2_pt1_highpass_state + d_pt1_highpass_k * (inner_derivative - d2_pt1_highpass_state);
-                        inner_derivative = derivative - d2_pt1_highpass_state;
-                    }
-                    if(balance_conf.kd_biquad_lowpass > 0){
-                        inner_derivative = biquad_process(inner_derivative, &d_biquad_lowpass);
-                    }
-                    if(balance_conf.kd_biquad_highpass > 0){
-                        inner_derivative = biquad_process(inner_derivative, &d_biquad_highpass);
-                    }
 
-                    inner_pid_value =
-                            (balance_conf.kp * inner_proportional) +
-                            (balance_conf.ki * inner_integral) +
-                            (balance_conf.kd * inner_derivative);
+                    pid_value = inner_pid_value + outer_pid_value;
 
-                    // limit output current
-                    float amplimit = 30.0;
-                    if (fabsf(inner_pid_value) > amplimit) {
-                        inner_pid_value = amplimit * SIGN(inner_pid_value);
+                    if (fabsf(pid_value) > 120) {
+                        pid_value = 120 * SIGN(pid_value);
                     }
-
-                    float pids[] = { pid_value, inner_pid_value };
-                    pid_value = average_filter(pids);
-
-                    last_erpm = erpm;
-                    last_measured_acceleration = measured_acceleration;
                 }
 
 				last_proportional = proportional;
@@ -933,6 +948,16 @@ static float app_balance_get_debug(int index){
 			return filtered_loop_overshoot;
 		case(13):
 			return filtered_diff_time;
+	    case(14):
+	        return pid_value;
+	    case(15):
+	        return outer_pid_value;
+	    case(16):
+	        return last_measured_acceleration;
+        case(17):
+            return (RPM(erpm) - RPM(last_erpm));
+        case(18):
+            return erpm - last_erpm;
 		default:
 			return 0;
 	}
