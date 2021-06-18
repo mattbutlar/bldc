@@ -318,6 +318,7 @@ static void reset_vars(void){
 	diff_time = 0;
 	brake_timeout = 0;
 	last_measured_acceleration = 0;
+    acceleration_compensation = 0;
 	outer_loop_count = 0;
 	inner_loop_multiplier = 5;
 }
