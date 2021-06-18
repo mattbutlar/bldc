@@ -701,8 +701,14 @@ static THD_FUNCTION(balance_thread, arg) {
                     acceleration_integral = acceleration_integral + acceleration_proportional;
 
                     //clear integral windup when compensation is within 1 degree of expected
-                    if (acceleration_integral < last_acceleration_integral) {
-                        acceleration_integral = 0;
+                    if (SIGN(last_acceleration_integral) * 1 == -1) {
+                        if (acceleration_integral > last_acceleration_integral) {
+                            acceleration_integral = 0;
+                        }
+                    } else {
+                        if (acceleration_integral < last_acceleration_integral) {
+                            acceleration_integral = 0;
+                        }
                     }
 
                     acceleration_compensation =
