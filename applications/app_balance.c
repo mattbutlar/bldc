@@ -98,8 +98,9 @@ static SwitchState switch_state;
 static BalanceState state;
 static float pitch_error;
 static float proportional, integral, derivative;
-static float outer_proportional, outer_integral, outer_derivative;
 static float last_proportional, abs_proportional;
+static float acceleration_proportional, acceleration_integral, acceleration_derivative;
+static float last_acceleration_integral;
 static float pid_value;
 static float acceleration_angle, acceleration_compensation;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
@@ -118,8 +119,6 @@ static float motor_timeout;
 static systime_t brake_timeout;
 static float last_measured_acceleration;
 
-static int outer_loop_count;
-static int inner_loop_multiplier;
 static const volatile mc_configuration *mc_conf;
 
 #define RPM(x)  (x / (mc_conf->si_motor_poles / 2))
@@ -297,6 +296,10 @@ static void reset_vars(void){
 	d_biquad_lowpass.z2 = 0;
 	d_biquad_highpass.z1 = 0;
 	d_biquad_highpass.z2 = 0;
+    acceleration_integral = 0;
+    last_acceleration_integral = 0;
+    last_measured_acceleration = 0;
+    acceleration_compensation = 0;
 	// Set values for startup
 	setpoint = pitch_angle;
 	setpoint_target_interpolated = pitch_angle;
@@ -317,10 +320,6 @@ static void reset_vars(void){
 	last_time = 0;
 	diff_time = 0;
 	brake_timeout = 0;
-	last_measured_acceleration = 0;
-    acceleration_compensation = 0;
-	outer_loop_count = 0;
-	inner_loop_multiplier = 5;
 }
 
 static float get_setpoint_adjustment_step_size(void){
@@ -589,16 +588,6 @@ static void set_current(float current, float yaw_current){
 //	}
 }
 
-static float average_filter(float args[], int count) {
-    float sum = 0;
-
-    for (int i = 0; i < count; i++) {
-        sum += args[i];
-    }
-
-    return sum / count;
-}
-
 static THD_FUNCTION(balance_thread, arg) {
 	(void)arg;
 	chRegSetThreadName("APP_BALANCE");
@@ -703,6 +692,28 @@ static THD_FUNCTION(balance_thread, arg) {
 				apply_torquetilt();
 				apply_turntilt();
 
+                if(balance_conf.multi_esc){
+                    float measured_acceleration = (RPS(erpm) - RPS(last_erpm));
+
+                    acceleration_angle = measured_acceleration * 360;
+
+                    acceleration_proportional = pitch_error - acceleration_angle;
+                    acceleration_integral = acceleration_integral + acceleration_proportional;
+
+                    //clear integral windup when compensation is within 1 degree of expected
+                    if (acceleration_integral < last_acceleration_integral) {
+                        acceleration_integral = 0;
+                    }
+
+                    acceleration_compensation =
+                            (balance_conf.yaw_kp * acceleration_proportional) +
+                            (balance_conf.yaw_ki * acceleration_integral);
+
+                    last_erpm = erpm;
+                    last_measured_acceleration = measured_acceleration;
+                    last_acceleration_integral = acceleration_integral;
+                }
+
 				pitch_error = setpoint - pitch_angle;
 				
 				// Do PID maths
@@ -730,28 +741,6 @@ static THD_FUNCTION(balance_thread, arg) {
 				}
 
 				pid_value = (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative);
-
-                if(balance_conf.multi_esc){
-                    if (outer_loop_count >= inner_loop_multiplier){
-                        float measured_acceleration = (RPL(erpm) - RPL(last_erpm)) * (balance_conf.hertz / inner_loop_multiplier);
-
-                        acceleration_angle = (measured_acceleration * 360) / inner_loop_multiplier;
-
-                        outer_proportional = pitch_error - acceleration_angle;
-
-                        acceleration_compensation = balance_conf.yaw_kp * outer_proportional;
-
-                        if (fabsf(acceleration_compensation) > 25) {
-                            acceleration_compensation = SIGN(acceleration_compensation) * 25;
-                        }
-
-                        last_erpm = erpm;
-                        last_measured_acceleration = measured_acceleration;
-                        outer_loop_count = 0;
-                    } else {
-                        outer_loop_count++;
-                    }
-                }
 
 				last_proportional = proportional;
 
@@ -937,9 +926,9 @@ static float app_balance_get_debug(int index){
 	    case(16):
 	        return last_measured_acceleration;
         case(17):
-            return pitch_error - acceleration_angle;
+            return acceleration_proportional;
         case(18):
-            return erpm - last_erpm;
+            return acceleration_compensation;
 		default:
 			return 0;
 	}
