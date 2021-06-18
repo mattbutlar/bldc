@@ -96,10 +96,12 @@ static SwitchState switch_state;
 
 // Rumtime state values
 static BalanceState state;
+static float pitch_error;
 static float proportional, integral, derivative;
 static float outer_proportional, outer_integral, outer_derivative;
 static float last_proportional, abs_proportional;
-static float pid_value, outer_pid_value, inner_pid_value;
+static float pid_value;
+static float acceleration_angle, acceleration_compensation;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
 static float constanttilt_target, constanttilt_interpolated;
 static float torquetilt_filtered_current, torquetilt_target, torquetilt_interpolated;
@@ -110,7 +112,7 @@ static float yaw_proportional, yaw_integral, yaw_derivative, yaw_last_proportion
 static systime_t current_time, last_time, diff_time, loop_overshoot;
 static float filtered_loop_overshoot, loop_overshoot_alpha, filtered_diff_time;
 static systime_t fault_angle_pitch_timer, fault_angle_roll_timer, fault_switch_timer, fault_switch_half_timer, fault_duty_timer;
-static float d_pt1_lowpass_state, d_pt1_lowpass_k, d_pt1_highpass_state, d_pt1_highpass_k, d2_pt1_lowpass_state, d2_pt1_highpass_state;
+static float d_pt1_lowpass_state, d_pt1_lowpass_k, d_pt1_highpass_state, d_pt1_highpass_k;
 static Biquad d_biquad_lowpass, d_biquad_highpass;
 static float motor_timeout;
 static systime_t brake_timeout;
@@ -700,8 +702,10 @@ static THD_FUNCTION(balance_thread, arg) {
 				apply_torquetilt();
 				apply_turntilt();
 
+				pitch_error = setpoint - pitch_angle;
+				
 				// Do PID maths
-				proportional = setpoint - pitch_angle;
+				proportional = pitch_error + acceleration_compensation;
 				// Apply deadzone
 				proportional = apply_deadzone(proportional);
 				// Resume real PID maths
@@ -727,47 +731,24 @@ static THD_FUNCTION(balance_thread, arg) {
 				pid_value = (balance_conf.kp * proportional) + (balance_conf.ki * integral) + (balance_conf.kd * derivative);
 
                 if(balance_conf.multi_esc){
-                    inner_pid_value = pid_value;
-
                     if (outer_loop_count >= inner_loop_multiplier){
-                        float measured_acceleration = ((RPL(last_erpm) - RPL(erpm)) * (balance_conf.hertz / inner_loop_multiplier));
+                        float measured_acceleration = (RPL(erpm) - RPL(last_erpm)) * (balance_conf.hertz / inner_loop_multiplier);
 
-                        outer_proportional = measured_acceleration;
-                        outer_integral += outer_proportional;
-                        outer_derivative = last_measured_acceleration - measured_acceleration;
+                        acceleration_angle = (measured_acceleration * 360) / inner_loop_multiplier;
 
-                        // Apply D term filters
-                        if(balance_conf.kd_pt1_lowpass_frequency > 0){
-                            d2_pt1_lowpass_state = d2_pt1_lowpass_state + d_pt1_lowpass_k * (outer_derivative - d2_pt1_lowpass_state);
-                            outer_derivative = d2_pt1_lowpass_state;
-                        }
-                        if(balance_conf.kd_pt1_highpass_frequency > 0){
-                            d2_pt1_highpass_state = d2_pt1_highpass_state + d_pt1_highpass_k * (outer_derivative - d2_pt1_highpass_state);
-                            outer_derivative = outer_derivative - d2_pt1_highpass_state;
-                        }
-                        if(balance_conf.kd_biquad_lowpass > 0){
-                            outer_derivative = biquad_process(outer_derivative, &d_biquad_lowpass);
-                        }
-                        if(balance_conf.kd_biquad_highpass > 0){
-                            outer_derivative = biquad_process(outer_derivative, &d_biquad_highpass);
-                        }
+                        outer_proportional = pitch_error - acceleration_angle;
 
-                        outer_pid_value =
-                                (balance_conf.yaw_kp * outer_proportional) +
-                                (balance_conf.yaw_ki * outer_integral) +
-                                (balance_conf.yaw_kd * outer_derivative);
+                        acceleration_compensation = balance_conf.yaw_kp * outer_proportional;
+
+                        if (fabsf(acceleration_compensation) > 25) {
+                            acceleration_compensation = SIGN(acceleration_compensation) * 25;
+                        }
 
                         last_erpm = erpm;
                         last_measured_acceleration = measured_acceleration;
                         outer_loop_count = 0;
                     } else {
                         outer_loop_count++;
-                    }
-
-                    pid_value = inner_pid_value + outer_pid_value;
-
-                    if (fabsf(pid_value) > 120) {
-                        pid_value = 120 * SIGN(pid_value);
                     }
                 }
 
@@ -951,11 +932,11 @@ static float app_balance_get_debug(int index){
 	    case(14):
 	        return pid_value;
 	    case(15):
-	        return outer_pid_value;
+	        return acceleration_angle;
 	    case(16):
 	        return last_measured_acceleration;
         case(17):
-            return (RPM(erpm) - RPM(last_erpm));
+            return pitch_error - acceleration_angle;
         case(18):
             return erpm - last_erpm;
 		default:
