@@ -100,7 +100,7 @@ static float pitch_error;
 static float proportional, integral, derivative;
 static float last_proportional, abs_proportional;
 static float acceleration_proportional, acceleration_integral, acceleration_derivative;
-static float last_acceleration_integral;
+static float last_acceleration_proportional;
 static float pid_value;
 static float acceleration_angle, acceleration_compensation;
 static float setpoint, setpoint_target, setpoint_target_interpolated;
@@ -297,7 +297,7 @@ static void reset_vars(void){
 	d_biquad_highpass.z1 = 0;
 	d_biquad_highpass.z2 = 0;
     acceleration_integral = 0;
-    last_acceleration_integral = 0;
+    last_acceleration_proportional = 0;
     last_measured_acceleration = 0;
     acceleration_compensation = 0;
 	// Set values for startup
@@ -701,12 +701,12 @@ static THD_FUNCTION(balance_thread, arg) {
                     acceleration_integral = acceleration_integral + acceleration_proportional;
 
                     //clear integral windup when compensation is within 1 degree of expected
-                    if (SIGN(last_acceleration_integral) * 1 == -1) {
-                        if (acceleration_integral > last_acceleration_integral) {
+                    if (SIGN(last_acceleration_proportional) * 1 == -1) {
+                        if (acceleration_proportional > -1) {
                             acceleration_integral = 0;
                         }
                     } else {
-                        if (acceleration_integral < last_acceleration_integral) {
+                        if (acceleration_proportional < 1) {
                             acceleration_integral = 0;
                         }
                     }
@@ -717,7 +717,7 @@ static THD_FUNCTION(balance_thread, arg) {
 
                     last_erpm = erpm;
                     last_measured_acceleration = measured_acceleration;
-                    last_acceleration_integral = acceleration_integral;
+                    last_acceleration_proportional = acceleration_proportional;
                 }
 
 				pitch_error = setpoint - pitch_angle;
